@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+documents/input/*
+documents/output/*
+!documents/input/.gitkeep
+!documents/output/.gitkeep

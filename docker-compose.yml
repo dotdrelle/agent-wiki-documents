@@ -1,0 +1,16 @@
+services:
+  documents-mcp:
+    build: .
+    ports:
+      - "${DOCUMENTS_MCP_PORT:-3337}:8080"
+    environment:
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
+      - DOCUMENT_INPUT_DIR=/documents/input
+      - DOCUMENT_OUTPUT_DIR=/documents/output
+      - DOCUMENT_MAX_UPLOAD_BYTES=${DOCUMENT_MAX_UPLOAD_BYTES:-52428800}
+      - DOCUMENT_ENABLE_OCR=${DOCUMENT_ENABLE_OCR:-true}
+      - DOCUMENT_OCR_LANG=${DOCUMENT_OCR_LANG:-eng+fra}
+    volumes:
+      - ${DOCUMENT_INPUT_HOST_DIR:-./documents/input}:/documents/input
+      - ${WIKI_WORKSPACE_PATH:?Set WIKI_WORKSPACE_PATH to an initialized llm-wiki workspace}/raw/untracked:/documents/output
+    restart: unless-stopped
