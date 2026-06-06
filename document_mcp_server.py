@@ -32,6 +32,7 @@ import uvicorn
 
 app = Server("agent-wiki-documents")
 
+_AGENT_VERSION = "0.5.1"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _DOCUMENT_INPUT_DIR = Path(os.environ.get("DOCUMENT_INPUT_DIR", "/documents/input")).resolve()
 _DOCUMENT_OUTPUT_DIR = Path(os.environ.get("DOCUMENT_OUTPUT_DIR", "/documents/output")).resolve()
@@ -114,6 +115,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
     <section class="panel">
       <dl>
         <dt>Status</dt><dd>Ready</dd>
+        <dt>Version</dt><dd><code>{_escape_html(_AGENT_VERSION)}</code></dd>
         <dt>Endpoint</dt><dd><code>{_escape_html(endpoint_url)}</code></dd>
         <dt>Transport</dt><dd>MCP Streamable HTTP over {_escape_html(scheme.upper())}</dd>
         <dt>Authentication</dt><dd>{_escape_html(auth_status)}</dd>
@@ -207,6 +209,7 @@ def _tool_status() -> list[TextContent]:
         {
             "ok": True,
             "service": "agent-wiki-documents",
+            "version": _AGENT_VERSION,
             "inputDir": str(_DOCUMENT_INPUT_DIR),
             "outputDir": str(_DOCUMENT_OUTPUT_DIR),
             "maxUploadBytes": _MAX_UPLOAD_BYTES,
@@ -430,6 +433,7 @@ def _with_metadata(markdown: str, source: Path, method: str) -> str:
         "source_file": source.name,
         "conversion_method": method,
         "service": "agent-wiki-documents",
+        "service_version": _AGENT_VERSION,
     }
     lines = ["---"]
     for key, value in front_matter.items():
