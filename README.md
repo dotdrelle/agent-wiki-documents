@@ -22,10 +22,32 @@ images and for PDFs where direct text extraction returns no useful text.
 
 ## Run Locally
 
+Standalone:
+
 ```bash
 cp .env.example .env
-# Edit .env and set WIKI_WORKSPACE_PATH + MCP_AUTH_TOKEN.
+# Edit .env: set WORKSPACES_ROOT and MCP_AUTH_TOKEN.
 docker compose up --build
+```
+
+Via `llm-wiki-manager` (recommended — starts all external agents together):
+
+```bash
+# manager/.env must have WORKSPACES_ROOT and DOCUMENTS_MCP_AUTH_TOKEN set
+wiki-workspace agents up
+```
+
+Register the endpoint in `mcp.endpoints.json`:
+
+```json
+{
+  "mcpServers": {
+    "documents": {
+      "url": "http://host.docker.internal:${DOCUMENTS_MCP_PORT:-3337}/mcp/",
+      "headers": { "Authorization": "Bearer ${DOCUMENTS_MCP_AUTH_TOKEN}" }
+    }
+  }
+}
 ```
 
 The MCP endpoint is:
@@ -43,14 +65,14 @@ documents/input/
 Generated Markdown files are written to:
 
 ```txt
-<wiki-workspace>/raw/untracked/
+<workspaces-root>/<workspace>/raw/untracked/
 ```
 
 ## Configuration
 
 ```bash
 export MCP_AUTH_TOKEN="$(openssl rand -hex 32)"
-export WIKI_WORKSPACE_PATH=/path/to/initialized/wiki-workspace
+export WORKSPACES_ROOT=/path/to/workspaces
 export DOCUMENTS_MCP_PORT=3337
 export DOCUMENT_INPUT_HOST_DIR=./documents/input
 export DOCUMENT_MAX_UPLOAD_BYTES=52428800
@@ -58,35 +80,42 @@ export DOCUMENT_ENABLE_OCR=true
 export DOCUMENT_OCR_LANG=eng+fra
 ```
 
-`docker-compose.yml` mounts `${WIKI_WORKSPACE_PATH}/raw/untracked` as the
-container output directory. Converted Markdown is therefore ready for
-`wiki ingest` without a copy step.
+`docker-compose.yml` mounts `${WORKSPACES_ROOT}` at `/workspaces`. When
+`documents_convert_to_markdown` receives `workspace`, converted Markdown is ready
+for `wiki ingest` in that workspace without a copy step.
 
 ## MCP Authentication
 
-Set `MCP_AUTH_TOKEN` before starting the container:
+When running via `wiki-workspace agents up`, set `DOCUMENTS_MCP_AUTH_TOKEN` in
+the manager's `.env`; it is mapped to `MCP_AUTH_TOKEN` inside the container.
+
+For standalone start:
 
 ```bash
 export MCP_AUTH_TOKEN="$(openssl rand -hex 32)"
 docker compose up --build
 ```
 
-MCP clients must send this HTTP header:
+MCP clients must send:
 
 ```txt
 Authorization: Bearer <same-token>
 ```
 
-If `MCP_AUTH_TOKEN` is empty, the server accepts unauthenticated MCP requests.
+If `MCP_AUTH_TOKEN` is empty, the server accepts unauthenticated requests.
 Use that only for local debugging.
 
 The conversion tool accepts either:
 
-- `filePath`: absolute path or path relative to `DOCUMENT_INPUT_DIR`.
+- `workspace`: optional target workspace. When set, output goes to that
+  workspace's `raw/untracked/`.
+- `filePath`: absolute path or path relative to the selected workspace or
+  `DOCUMENT_INPUT_DIR`.
 - `base64Content` plus `filename`: direct upload-style conversion.
 
 Optional arguments:
 
-- `outputFilename`: Markdown filename written under `DOCUMENT_OUTPUT_DIR`.
+- `outputFilename`: Markdown filename written under the workspace output
+  directory or `DOCUMENT_OUTPUT_DIR` when no workspace is provided.
 - `forceOcr`: force OCR for supported inputs.
 - `includeMetadata`: include YAML front matter, defaults to true.

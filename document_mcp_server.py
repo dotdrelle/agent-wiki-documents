@@ -32,10 +32,11 @@ import uvicorn
 
 app = Server("agent-wiki-documents")
 
-_AGENT_VERSION = "0.5.21"
+_AGENT_VERSION = "0.6.8"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _DOCUMENT_INPUT_DIR = Path(os.environ.get("DOCUMENT_INPUT_DIR", "/documents/input")).resolve()
 _DOCUMENT_OUTPUT_DIR = Path(os.environ.get("DOCUMENT_OUTPUT_DIR", "/documents/output")).resolve()
+_WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
 _MAX_UPLOAD_BYTES = int(os.environ.get("DOCUMENT_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 _OCR_LANG = os.environ.get("DOCUMENT_OCR_LANG", "eng+fra")
 _ENABLE_OCR = os.environ.get("DOCUMENT_ENABLE_OCR", "true").lower() not in {"0", "false", "no"}
@@ -71,6 +72,31 @@ def _escape_html(value: str) -> str:
 
 def _json_text(payload: dict[str, Any]) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
+
+
+def _validate_workspace(name: str) -> Path:
+    value = str(name or "").strip()
+    if not value or "/" in value or "\\" in value or value in {".", ".."} or ".." in value:
+        raise ValueError(f"Invalid workspace: {name}")
+    path = (_WORKSPACES_ROOT / value).resolve()
+    try:
+        path.relative_to(_WORKSPACES_ROOT)
+    except ValueError as exc:
+        raise ValueError("Path traversal attempt") from exc
+    if not path.is_dir():
+        raise ValueError(f"Unknown workspace: {value}")
+    return path
+
+
+def _ensure_inside(path: Path, roots: list[Path]) -> None:
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return
+        except ValueError:
+            continue
+    allowed = ", ".join(str(root) for root in roots)
+    raise ValueError(f"Input path is outside allowed roots: {allowed}")
 
 
 def _render_landing_page(endpoint_url: str, scheme: str) -> str:
@@ -121,6 +147,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
         <dt>Authentication</dt><dd>{_escape_html(auth_status)}</dd>
         <dt>Input dir</dt><dd><code>{_escape_html(str(_DOCUMENT_INPUT_DIR))}</code></dd>
         <dt>Output dir</dt><dd><code>{_escape_html(str(_DOCUMENT_OUTPUT_DIR))}</code></dd>
+        <dt>Workspaces root</dt><dd><code>{_escape_html(str(_WORKSPACES_ROOT))}</code></dd>
         <dt>OCR</dt><dd>{_escape_html("enabled" if _ENABLE_OCR else "disabled")} / <code>{_escape_html(_OCR_LANG)}</code></dd>
       </dl>
     </section>
@@ -156,7 +183,11 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "filePath": {
                         "type": "string",
-                        "description": "Path to an input file, absolute or relative to DOCUMENT_INPUT_DIR.",
+                        "description": "Path to an input file, absolute or relative to the workspace or DOCUMENT_INPUT_DIR.",
+                    },
+                    "workspace": {
+                        "type": "string",
+                        "description": "Optional target workspace name. When set, Markdown is written to <workspace>/raw/untracked.",
                     },
                     "filename": {
                         "type": "string",
@@ -212,6 +243,7 @@ def _tool_status() -> list[TextContent]:
             "version": _AGENT_VERSION,
             "inputDir": str(_DOCUMENT_INPUT_DIR),
             "outputDir": str(_DOCUMENT_OUTPUT_DIR),
+            "workspacesRoot": str(_WORKSPACES_ROOT),
             "maxUploadBytes": _MAX_UPLOAD_BYTES,
             "ocr": {
                 "enabled": _ENABLE_OCR,
@@ -226,20 +258,24 @@ def _tool_status() -> list[TextContent]:
 
 
 def _tool_convert_to_markdown(args: dict[str, Any]) -> list[TextContent]:
-    _DOCUMENT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    workspace = str(args.get("workspace", "") or "").strip()
+    workspace_path = _validate_workspace(workspace) if workspace else None
+    output_dir = (workspace_path / "raw" / "untracked") if workspace_path else _DOCUMENT_OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
     include_metadata = bool(args.get("includeMetadata", True))
     force_ocr = bool(args.get("forceOcr", False))
 
     with tempfile.TemporaryDirectory(prefix="agent-wiki-documents-") as tmpdir:
-        source = _resolve_source(args, Path(tmpdir))
+        source = _resolve_source(args, Path(tmpdir), workspace_path)
         markdown, method = _convert_file(source, Path(tmpdir), force_ocr=force_ocr)
         output_name = _safe_output_name(args.get("outputFilename"), source)
-        output_path = _DOCUMENT_OUTPUT_DIR / output_name
+        output_path = output_dir / output_name
         final_markdown = _with_metadata(markdown, source, method) if include_metadata else markdown
         output_path.write_text(final_markdown, encoding="utf-8")
         return _json_text(
             {
                 "ok": True,
+                "workspace": workspace or None,
                 "source": str(source),
                 "outputPath": str(output_path),
                 "method": method,
@@ -249,16 +285,25 @@ def _tool_convert_to_markdown(args: dict[str, Any]) -> list[TextContent]:
         )
 
 
-def _resolve_source(args: dict[str, Any], tmpdir: Path) -> Path:
+def _resolve_source(args: dict[str, Any], tmpdir: Path, workspace_path: Path | None) -> Path:
     file_path = str(args.get("filePath", "") or "").strip()
     base64_content = str(args.get("base64Content", "") or "").strip()
     if file_path and base64_content:
         raise ValueError("Provide either filePath or base64Content, not both.")
     if file_path:
-        path = Path(file_path)
-        if not path.is_absolute():
-            path = _DOCUMENT_INPUT_DIR / path
-        path = path.resolve()
+        raw_path = Path(file_path)
+        if raw_path.is_absolute():
+            path = raw_path.resolve()
+        elif workspace_path:
+            workspace_candidate = (workspace_path / raw_path).resolve()
+            input_candidate = (_DOCUMENT_INPUT_DIR / raw_path).resolve()
+            path = workspace_candidate if workspace_candidate.is_file() else input_candidate
+        else:
+            path = (_DOCUMENT_INPUT_DIR / raw_path).resolve()
+        allowed_roots = [_DOCUMENT_INPUT_DIR]
+        if workspace_path:
+            allowed_roots.insert(0, workspace_path)
+        _ensure_inside(path, allowed_roots)
         if not path.is_file():
             raise ValueError(f"Input file does not exist: {path}")
         return path
@@ -500,10 +545,28 @@ def create_starlette_app() -> Starlette:
 def main() -> None:
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8080"))
+    ssl_certfile = os.environ.get("MCP_SSL_CERTFILE")
+    ssl_keyfile = os.environ.get("MCP_SSL_KEYFILE")
+
+    uvicorn_kwargs: dict[str, Any] = {"host": host, "port": port}
+    if ssl_certfile or ssl_keyfile:
+        missing = [name for name, val in (("MCP_SSL_CERTFILE", ssl_certfile), ("MCP_SSL_KEYFILE", ssl_keyfile)) if not val]
+        if missing:
+            raise RuntimeError(f"TLS misconfigured — missing variables: {', '.join(missing)}")
+        for label, path in (("MCP_SSL_CERTFILE", ssl_certfile), ("MCP_SSL_KEYFILE", ssl_keyfile)):
+            if not Path(path).exists():
+                raise RuntimeError(f"TLS misconfigured — file not found: {label}={path}")
+        uvicorn_kwargs["ssl_certfile"] = ssl_certfile
+        uvicorn_kwargs["ssl_keyfile"] = ssl_keyfile
+        print(f"[document-mcp] HTTPS enabled — cert={ssl_certfile}")
+    else:
+        print(f"[document-mcp] HTTP (no TLS)")
+
+    scheme = "https" if ssl_certfile else "http"
     _DOCUMENT_INPUT_DIR.mkdir(parents=True, exist_ok=True)
     _DOCUMENT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"[document-mcp] Streamable HTTP on http://{host}:{port}/mcp")
-    uvicorn.run(create_starlette_app(), host=host, port=port)
+    print(f"[document-mcp] Streamable HTTP on {scheme}://{host}:{port}/mcp")
+    uvicorn.run(create_starlette_app(), **uvicorn_kwargs)
 
 
 if __name__ == "__main__":
