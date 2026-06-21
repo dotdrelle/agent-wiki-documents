@@ -11,6 +11,7 @@ services:
       - DOCUMENT_MAX_UPLOAD_BYTES=${DOCUMENT_MAX_UPLOAD_BYTES:-52428800}
       - DOCUMENT_ENABLE_OCR=${DOCUMENT_ENABLE_OCR:-true}
       - DOCUMENT_OCR_LANG=${DOCUMENT_OCR_LANG:-eng+fra}
+      - DOCUMENT_FORCE_OCR=${DOCUMENT_FORCE_OCR:-false}
       # HTTPS — uncomment and provide files in ./certs/
       #- MCP_SSL_CERTFILE=/certs/server.crt
       #- MCP_SSL_KEYFILE=/certs/server.key

@@ -27,6 +27,7 @@ ENV DOCUMENT_OUTPUT_DIR=/documents/output
 ENV DOCUMENT_MAX_UPLOAD_BYTES=52428800
 ENV DOCUMENT_ENABLE_OCR=true
 ENV DOCUMENT_OCR_LANG=eng+fra
+ENV DOCUMENT_FORCE_OCR=false
 
 RUN mkdir -p /documents/input /documents/output
 

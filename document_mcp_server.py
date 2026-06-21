@@ -40,6 +40,7 @@ _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolv
 _MAX_UPLOAD_BYTES = int(os.environ.get("DOCUMENT_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 _OCR_LANG = os.environ.get("DOCUMENT_OCR_LANG", "eng+fra")
 _ENABLE_OCR = os.environ.get("DOCUMENT_ENABLE_OCR", "true").lower() not in {"0", "false", "no"}
+_FORCE_OCR = os.environ.get("DOCUMENT_FORCE_OCR", "false").lower() in {"1", "true", "yes"}
 
 if not _MCP_TOKEN:
     print("[document-mcp] Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients.")
@@ -148,7 +149,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
         <dt>Input dir</dt><dd><code>{_escape_html(str(_DOCUMENT_INPUT_DIR))}</code></dd>
         <dt>Output dir</dt><dd><code>{_escape_html(str(_DOCUMENT_OUTPUT_DIR))}</code></dd>
         <dt>Workspaces root</dt><dd><code>{_escape_html(str(_WORKSPACES_ROOT))}</code></dd>
-        <dt>OCR</dt><dd>{_escape_html("enabled" if _ENABLE_OCR else "disabled")} / <code>{_escape_html(_OCR_LANG)}</code></dd>
+        <dt>OCR</dt><dd>{_escape_html("enabled" if _ENABLE_OCR else "disabled")} / <code>{_escape_html(_OCR_LANG)}</code> / force={_escape_html("true" if _FORCE_OCR else "false")}</dd>
       </dl>
     </section>
     <section class="panel">
@@ -176,7 +177,8 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Convert a PDF, Office document, text file or image to Markdown. Provide either filePath for a file "
                 "mounted under DOCUMENT_INPUT_DIR, or base64Content plus filename for direct upload. OCR is used for "
-                "images and PDF pages where direct text extraction is empty."
+                "images and PDF pages where direct text extraction is empty. Pass forceOcr=true, or set "
+                "DOCUMENT_FORCE_OCR=true on the server, to force OCR for PDFs."
             ),
             inputSchema={
                 "type": "object",
@@ -248,6 +250,7 @@ def _tool_status() -> list[TextContent]:
             "ocr": {
                 "enabled": _ENABLE_OCR,
                 "lang": _OCR_LANG,
+                "forceByDefault": _FORCE_OCR,
                 "tesseractAvailable": bool(shutil.which("tesseract")),
                 "pdftoppmAvailable": bool(shutil.which("pdftoppm")),
             },
@@ -263,7 +266,7 @@ def _tool_convert_to_markdown(args: dict[str, Any]) -> list[TextContent]:
     output_dir = (workspace_path / "raw" / "untracked") if workspace_path else _DOCUMENT_OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     include_metadata = bool(args.get("includeMetadata", True))
-    force_ocr = bool(args.get("forceOcr", False))
+    force_ocr = _coerce_bool(args.get("forceOcr", _FORCE_OCR))
 
     with tempfile.TemporaryDirectory(prefix="agent-wiki-documents-") as tmpdir:
         source = _resolve_source(args, Path(tmpdir), workspace_path)
@@ -319,6 +322,14 @@ def _resolve_source(args: dict[str, Any], tmpdir: Path, workspace_path: Path | N
         path.write_bytes(data)
         return path
     raise ValueError("Provide filePath or base64Content.")
+
+
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return bool(value)
 
 
 _TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".csv", ".json", ".xml", ".yaml", ".yml", ".html", ".htm", ".rtf"}

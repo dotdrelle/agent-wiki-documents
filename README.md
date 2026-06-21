@@ -78,6 +78,7 @@ export DOCUMENT_INPUT_HOST_DIR=./documents/input
 export DOCUMENT_MAX_UPLOAD_BYTES=52428800
 export DOCUMENT_ENABLE_OCR=true
 export DOCUMENT_OCR_LANG=eng+fra
+export DOCUMENT_FORCE_OCR=false
 ```
 
 `docker-compose.yml` mounts `${WORKSPACES_ROOT}` at `/workspaces`. When
@@ -117,5 +118,6 @@ Optional arguments:
 
 - `outputFilename`: Markdown filename written under the workspace output
   directory or `DOCUMENT_OUTPUT_DIR` when no workspace is provided.
-- `forceOcr`: force OCR for supported inputs.
+- `forceOcr`: force OCR for supported inputs. For a server-wide default, set
+  `DOCUMENT_FORCE_OCR=true`.
 - `includeMetadata`: include YAML front matter, defaults to true.
