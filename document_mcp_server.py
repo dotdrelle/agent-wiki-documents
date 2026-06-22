@@ -6,15 +6,18 @@ import contextlib
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
-import zipfile
+import urllib.error
+import urllib.request
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
-from xml.etree import ElementTree
 
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -25,22 +28,32 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse
-from starlette.routing import Mount
+from starlette.routing import Mount, Route
 from starlette.types import Receive, Scope, Send
 import uvicorn
 
 
 app = Server("agent-wiki-documents")
 
-_AGENT_VERSION = "0.6.10"
+_AGENT_VERSION = "0.6.17"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _DOCUMENT_INPUT_DIR = Path(os.environ.get("DOCUMENT_INPUT_DIR", "/documents/input")).resolve()
 _DOCUMENT_OUTPUT_DIR = Path(os.environ.get("DOCUMENT_OUTPUT_DIR", "/documents/output")).resolve()
 _WORKSPACES_ROOT = Path(os.environ.get("WORKSPACES_ROOT", "/workspaces")).resolve()
 _MAX_UPLOAD_BYTES = int(os.environ.get("DOCUMENT_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
-_OCR_LANG = os.environ.get("DOCUMENT_OCR_LANG", "eng+fra")
-_ENABLE_OCR = os.environ.get("DOCUMENT_ENABLE_OCR", "true").lower() not in {"0", "false", "no"}
-_FORCE_OCR = os.environ.get("DOCUMENT_FORCE_OCR", "false").lower() in {"1", "true", "yes"}
+_LLM_BASE_URL = os.environ.get("DOCUMENT_LLM_BASE_URL", os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
+_LLM_API_KEY = os.environ.get("DOCUMENT_LLM_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+_LLM_MODEL = os.environ.get("DOCUMENT_LLM_MODEL", "gpt-5.4-mini")
+_LLM_TIMEOUT_SECONDS = int(os.environ.get("DOCUMENT_LLM_TIMEOUT_SECONDS", "120"))
+
+_conversion_jobs: dict[str, dict[str, Any]] = {}
+_jobs_lock = threading.Lock()
+
+_CONVERSION_PLAN_STEPS = [
+    {"id": "resolve", "label": "Résoudre le fichier source"},
+    {"id": "convert", "label": "Convertir en Markdown"},
+    {"id": "write", "label": "Écrire le Markdown converti"},
+]
 
 if not _MCP_TOKEN:
     print("[document-mcp] Warning: MCP_AUTH_TOKEN is not configured; the endpoint accepts unauthenticated clients.")
@@ -73,6 +86,99 @@ def _escape_html(value: str) -> str:
 
 def _json_text(payload: dict[str, Any]) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
+
+
+_STEP_INDEX = {"resolve": 1, "convert": 2, "write": 3}
+_STEP_PERCENT = {"resolve": 10, "convert": 60, "write": 90}
+
+
+def _activity_for_job(job_id: str, job: dict[str, Any]) -> dict[str, Any]:
+    status = job["status"]
+    terminal = status in {"done", "failed", "error"}
+    step_id = job.get("stepId", "resolve")
+    step_index = _STEP_INDEX.get(step_id, 1)
+    percent = 100 if status == "done" else (_STEP_PERCENT.get(step_id, 0) if status == "running" else 0)
+    source_name = job.get("sourceName") or job_id
+    return {
+        "id": f"documents:{source_name}",
+        "source": "documents",
+        "kind": "conversion",
+        "label": f"Documents: conversion {source_name}",
+        "status": status,
+        "progress": {
+            "percent": percent,
+            "step": "conversion",
+            "stepId": step_id,
+            "stepIndex": step_index,
+            "stepTotal": 3,
+            "method": job.get("method"),
+            "detail": job.get("detail"),
+        },
+        "plan": {"steps": _CONVERSION_PLAN_STEPS},
+        "poll": {
+            "server": "documents",
+            "tool": "documents_conversion_status",
+            "args": {"jobId": job_id},
+            "intervalMs": 2500,
+        },
+        "startedAt": job.get("startedAt"),
+        "updatedAt": _utc_now(),
+        "error": job.get("error"),
+        "terminal": terminal,
+    }
+
+
+def _run_conversion_job(job_id: str, args: dict[str, Any]) -> None:
+    def update(step_id: str, detail: str | None = None) -> None:
+        with _jobs_lock:
+            _conversion_jobs[job_id]["stepId"] = step_id
+            _conversion_jobs[job_id]["detail"] = detail
+
+    tmpdir_obj = tempfile.TemporaryDirectory(prefix="agent-wiki-documents-")
+    tmpdir = Path(tmpdir_obj.name)
+    try:
+        update("resolve", "Résolution du fichier source")
+        workspace = str(args.get("workspace", "") or "").strip()
+        workspace_path = _validate_workspace(workspace) if workspace else None
+        output_dir = (workspace_path / "raw" / "untracked") if workspace_path else _DOCUMENT_OUTPUT_DIR
+        output_dir.mkdir(parents=True, exist_ok=True)
+        include_metadata = bool(args.get("includeMetadata", True))
+        source = _resolve_source(args, tmpdir, workspace_path)
+        with _jobs_lock:
+            _conversion_jobs[job_id]["sourceName"] = source.name
+            _conversion_jobs[job_id]["sourceStr"] = str(source)
+
+        update("convert", f"Conversion de {source.name}")
+        markdown, method = _convert_file(source, tmpdir)
+        with _jobs_lock:
+            _conversion_jobs[job_id]["method"] = method
+
+        update("write", "Écriture du Markdown converti")
+        output_name = _safe_output_name(args.get("outputFilename"), source)
+        output_path = output_dir / output_name
+        final_markdown = _with_metadata(markdown, source, method) if include_metadata else markdown
+        output_path.write_text(final_markdown, encoding="utf-8")
+        with _jobs_lock:
+            _conversion_jobs[job_id].update({
+                "status": "done",
+                "stepId": "write",
+                "outputPath": str(output_path),
+                "bytes": output_path.stat().st_size,
+                "markdown": final_markdown,
+                "detail": None,
+            })
+    except Exception as exc:
+        with _jobs_lock:
+            _conversion_jobs[job_id]["status"] = "failed"
+            _conversion_jobs[job_id]["error"] = str(exc)
+            _conversion_jobs[job_id]["detail"] = None
+        print(f"[document-mcp] conversion job {job_id} failed: {exc}")
+    finally:
+        tmpdir_obj.cleanup()
+
+
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
 def _validate_workspace(name: str) -> Path:
@@ -149,7 +255,7 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
         <dt>Input dir</dt><dd><code>{_escape_html(str(_DOCUMENT_INPUT_DIR))}</code></dd>
         <dt>Output dir</dt><dd><code>{_escape_html(str(_DOCUMENT_OUTPUT_DIR))}</code></dd>
         <dt>Workspaces root</dt><dd><code>{_escape_html(str(_WORKSPACES_ROOT))}</code></dd>
-        <dt>OCR</dt><dd>{_escape_html("enabled" if _ENABLE_OCR else "disabled")} / <code>{_escape_html(_OCR_LANG)}</code> / force={_escape_html("true" if _FORCE_OCR else "false")}</dd>
+        <dt>OCR</dt><dd>LLM vision / <code>{_escape_html(_LLM_MODEL)}</code></dd>
       </dl>
     </section>
     <section class="panel">
@@ -160,6 +266,72 @@ def _render_landing_page(endpoint_url: str, scheme: str) -> str:
       </ul>
     </section>
   </main>
+</body>
+</html>"""
+
+
+def _render_correction_page() -> str:
+    return """<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Correction Mermaid locale</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#f8fafc; --panel:#fff; --text:#111827; --muted:#64748b; --line:#d8dee8; --accent:#2563eb; --code:#eef2ff; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#0f172a; --panel:#111827; --text:#f8fafc; --muted:#94a3b8; --line:#253044; --accent:#60a5fa; --code:#1e293b; } }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; background:var(--bg); color:var(--text); font:14px/1.45 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    main { width:min(1180px,calc(100% - 32px)); margin:0 auto; padding:32px 0; }
+    h1 { margin:0 0 16px; font-size:28px; letter-spacing:0; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; align-items:start; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
+    label { display:block; color:var(--muted); font-weight:700; margin:0 0 8px; }
+    textarea { width:100%; min-height:320px; resize:vertical; border:1px solid var(--line); border-radius:6px; background:transparent; color:var(--text); padding:10px; font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
+    button { border:1px solid var(--line); border-radius:6px; background:var(--accent); color:white; padding:8px 12px; font-weight:700; cursor:pointer; }
+    .toolbar { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0; }
+    pre { min-height:180px; white-space:pre-wrap; overflow:auto; border:1px solid var(--line); border-radius:6px; background:var(--code); padding:10px; margin:0; font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; }
+    @media (max-width:820px) { .grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Correction Mermaid locale</h1>
+    <div class="grid">
+      <section class="panel">
+        <label for="ocr">OCR / notes de correction</label>
+        <textarea id="ocr" spellcheck="false"></textarea>
+      </section>
+      <section class="panel">
+        <label for="mermaid">Mermaid corrige</label>
+        <textarea id="mermaid" spellcheck="false">flowchart LR
+  A["Source"] --> B["Cible"]</textarea>
+      </section>
+    </div>
+    <div class="toolbar">
+      <button type="button" onclick="buildMarkdown()">Generer Markdown</button>
+      <button type="button" onclick="copyMarkdown()">Copier Markdown</button>
+    </div>
+    <section class="panel">
+      <label for="markdown">Markdown corrige</label>
+      <pre id="markdown"></pre>
+    </section>
+  </main>
+  <script>
+    function buildMarkdown() {
+      const ocr = document.getElementById('ocr').value.trim();
+      const mermaid = document.getElementById('mermaid').value.trim();
+      const parts = [];
+      if (ocr) parts.push(ocr);
+      if (mermaid) parts.push('## Diagramme Mermaid\\n\\n```mermaid\\n' + mermaid + '\\n```');
+      document.getElementById('markdown').textContent = parts.join('\\n\\n');
+    }
+    async function copyMarkdown() {
+      buildMarkdown();
+      await navigator.clipboard.writeText(document.getElementById('markdown').textContent);
+    }
+    buildMarkdown();
+  </script>
 </body>
 </html>"""
 
@@ -175,10 +347,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="documents_convert_to_markdown",
             description=(
-                "Convert a PDF, Office document, text file or image to Markdown. Provide either filePath for a file "
-                "mounted under DOCUMENT_INPUT_DIR, or base64Content plus filename for direct upload. OCR is used for "
-                "images and PDF pages where direct text extraction is empty. Pass forceOcr=true, or set "
-                "DOCUMENT_FORCE_OCR=true on the server, to force OCR for PDFs."
+                "Convert a PDF, Office document, text file or image to Markdown. Starts an async job and returns "
+                "immediately with a jobId and a running _activity. Poll documents_conversion_status to track progress. "
+                "Provide either filePath for a file mounted under DOCUMENT_INPUT_DIR, or base64Content plus filename "
+                "for direct upload."
             ),
             inputSchema={
                 "type": "object",
@@ -203,15 +375,23 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional Markdown output filename. Defaults to the input stem plus .md.",
                     },
-                    "forceOcr": {
-                        "type": "boolean",
-                        "description": "Force OCR even if text extraction succeeds for supported types.",
-                    },
                     "includeMetadata": {
                         "type": "boolean",
                         "description": "Include Markdown front matter metadata. Defaults to true.",
                     },
                 },
+                "additionalProperties": False,
+            },
+        ),
+        Tool(
+            name="documents_conversion_status",
+            description="Poll the status of an async documents_convert_to_markdown job. Returns _activity with progress and, when done, the conversion result.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "jobId": {"type": "string", "description": "Job ID returned by documents_convert_to_markdown."},
+                },
+                "required": ["jobId"],
                 "additionalProperties": False,
             },
         ),
@@ -228,6 +408,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 result = _tool_status()
             case "documents_convert_to_markdown":
                 result = _tool_convert_to_markdown(arguments)
+            case "documents_conversion_status":
+                result = _tool_conversion_status(arguments)
             case _:
                 raise ValueError(f"Unknown tool: {name}")
         print(f"[document-mcp] tools/result {name} ok {int((time.time() - start) * 1000)}ms")
@@ -248,44 +430,60 @@ def _tool_status() -> list[TextContent]:
             "workspacesRoot": str(_WORKSPACES_ROOT),
             "maxUploadBytes": _MAX_UPLOAD_BYTES,
             "ocr": {
-                "enabled": _ENABLE_OCR,
-                "lang": _OCR_LANG,
-                "forceByDefault": _FORCE_OCR,
-                "tesseractAvailable": bool(shutil.which("tesseract")),
+                "pipeline": "llm-vision-markdown",
+                "baseUrl": _LLM_BASE_URL,
+                "model": _LLM_MODEL,
+                "apiKeyConfigured": bool(_LLM_API_KEY),
                 "pdftoppmAvailable": bool(shutil.which("pdftoppm")),
+                "correctionScreen": "/correction",
             },
-            "office": {"libreOfficeAvailable": bool(shutil.which("libreoffice"))},
+            "office": {"converter": "markitdown"},
+            **({"mmdc": {"available": True}} if shutil.which("mmdc") else {}),
             "supportedExtensions": sorted(_SUPPORTED_EXTENSIONS),
         }
     )
 
 
 def _tool_convert_to_markdown(args: dict[str, Any]) -> list[TextContent]:
-    workspace = str(args.get("workspace", "") or "").strip()
-    workspace_path = _validate_workspace(workspace) if workspace else None
-    output_dir = (workspace_path / "raw" / "untracked") if workspace_path else _DOCUMENT_OUTPUT_DIR
-    output_dir.mkdir(parents=True, exist_ok=True)
-    include_metadata = bool(args.get("includeMetadata", True))
-    force_ocr = _coerce_bool(args.get("forceOcr", _FORCE_OCR))
+    job_id = uuid.uuid4().hex[:8]
+    with _jobs_lock:
+        _conversion_jobs[job_id] = {
+            "status": "running",
+            "stepId": "resolve",
+            "startedAt": _utc_now(),
+            "sourceName": None,
+            "sourceStr": None,
+            "method": None,
+            "outputPath": None,
+            "bytes": None,
+            "markdown": None,
+            "error": None,
+            "detail": None,
+        }
+    threading.Thread(target=_run_conversion_job, args=(job_id, args), daemon=True).start()
+    with _jobs_lock:
+        job = dict(_conversion_jobs[job_id])
+    return _json_text({"ok": True, "jobId": job_id, "_activity": _activity_for_job(job_id, job)})
 
-    with tempfile.TemporaryDirectory(prefix="agent-wiki-documents-") as tmpdir:
-        source = _resolve_source(args, Path(tmpdir), workspace_path)
-        markdown, method = _convert_file(source, Path(tmpdir), force_ocr=force_ocr)
-        output_name = _safe_output_name(args.get("outputFilename"), source)
-        output_path = output_dir / output_name
-        final_markdown = _with_metadata(markdown, source, method) if include_metadata else markdown
-        output_path.write_text(final_markdown, encoding="utf-8")
-        return _json_text(
-            {
-                "ok": True,
-                "workspace": workspace or None,
-                "source": str(source),
-                "outputPath": str(output_path),
-                "method": method,
-                "bytes": output_path.stat().st_size,
-                "markdown": final_markdown,
-            }
-        )
+
+def _tool_conversion_status(args: dict[str, Any]) -> list[TextContent]:
+    job_id = str(args.get("jobId", "") or "").strip()
+    with _jobs_lock:
+        job = dict(_conversion_jobs.get(job_id) or {})
+    if not job:
+        return _json_text({"ok": False, "error": f"Unknown job: {job_id}"})
+    activity = _activity_for_job(job_id, job)
+    result: dict[str, Any] = {"ok": True, "jobId": job_id, "_activity": activity}
+    if job.get("status") == "done":
+        result.update({
+            "outputPath": job.get("outputPath"),
+            "method": job.get("method"),
+            "bytes": job.get("bytes"),
+            "markdown": job.get("markdown"),
+        })
+    elif job.get("status") in {"failed", "error"}:
+        result["error"] = job.get("error")
+    return _json_text(result)
 
 
 def _resolve_source(args: dict[str, Any], tmpdir: Path, workspace_path: Path | None) -> Path:
@@ -324,38 +522,27 @@ def _resolve_source(args: dict[str, Any], tmpdir: Path, workspace_path: Path | N
     raise ValueError("Provide filePath or base64Content.")
 
 
-def _coerce_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes"}
-    return bool(value)
-
-
 _TEXT_EXTENSIONS = {".txt", ".md", ".markdown", ".csv", ".json", ".xml", ".yaml", ".yml", ".html", ".htm", ".rtf"}
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 _OFFICE_EXTENSIONS = {".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls", ".odt", ".ods", ".odp"}
 _SUPPORTED_EXTENSIONS = _TEXT_EXTENSIONS | _IMAGE_EXTENSIONS | _OFFICE_EXTENSIONS | {".pdf"}
 
 
-def _convert_file(path: Path, tmpdir: Path, force_ocr: bool) -> tuple[str, str]:
+def _convert_file(path: Path, tmpdir: Path) -> tuple[str, str]:
     suffix = path.suffix.lower()
     if suffix not in _SUPPORTED_EXTENSIONS:
         mime, _ = mimetypes.guess_type(path.name)
         raise ValueError(f"Unsupported file type: {suffix or mime or 'unknown'}")
     if suffix in _TEXT_EXTENSIONS:
         return _convert_text(path), "text"
-    if suffix == ".docx":
-        return _convert_docx(path), "docx-xml"
     if suffix in _OFFICE_EXTENSIONS:
-        return _convert_office(path, tmpdir), "libreoffice-pdf"
+        return _convert_markitdown(path, enable_llm_plugins=True), f"markitdown{suffix}"
     if suffix in _IMAGE_EXTENSIONS:
-        return _ocr_image(path), "image-ocr"
+        markdown = _ocr_image(path, tmpdir)
+        method = "image-llm-ocr-mermaid" if "```mermaid" in markdown else "image-llm-ocr"
+        return markdown, method
     if suffix == ".pdf":
-        text = "" if force_ocr else _extract_pdf_text(path)
-        if text.strip():
-            return _plain_text_to_markdown(text), "pdf-text"
-        return _ocr_pdf(path, tmpdir), "pdf-ocr"
+        return _convert_pdf(path, tmpdir)
     raise ValueError(f"Unsupported file type: {suffix}")
 
 
@@ -372,40 +559,39 @@ def _convert_text(path: Path) -> str:
     return text if path.suffix.lower() in {".md", ".markdown"} else _plain_text_to_markdown(text)
 
 
-def _convert_docx(path: Path) -> str:
-    with zipfile.ZipFile(path) as archive:
-        xml = archive.read("word/document.xml")
-    root = ElementTree.fromstring(xml)
-    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    paragraphs: list[str] = []
-    for paragraph in root.findall(".//w:p", namespace):
-        parts = [node.text or "" for node in paragraph.findall(".//w:t", namespace)]
-        line = "".join(parts).strip()
-        if line:
-            paragraphs.append(line)
-    return "\n\n".join(paragraphs).strip() + "\n"
+def _convert_markitdown(path: Path, enable_llm_plugins: bool = False) -> str:
+    try:
+        from markitdown import MarkItDown
+    except ImportError as exc:
+        raise ValueError("MarkItDown is required for this document type.") from exc
 
+    kwargs: dict[str, Any] = {"enable_plugins": enable_llm_plugins}
+    if enable_llm_plugins and _LLM_API_KEY and _LLM_MODEL:
+        try:
+            from openai import OpenAI
 
-def _convert_office(path: Path, tmpdir: Path) -> str:
-    libreoffice = shutil.which("libreoffice")
-    if not libreoffice:
-        raise ValueError("LibreOffice is required to convert this Office format.")
-    subprocess.run(
-        [libreoffice, "--headless", "--convert-to", "pdf", "--outdir", str(tmpdir), str(path)],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=120,
-    )
-    pdf_path = tmpdir / f"{path.stem}.pdf"
-    if not pdf_path.is_file():
-        matches = list(tmpdir.glob("*.pdf"))
-        if not matches:
-            raise ValueError("LibreOffice did not produce a PDF output.")
-        pdf_path = matches[0]
-    text = _extract_pdf_text(pdf_path)
-    return _plain_text_to_markdown(text) if text.strip() else _ocr_pdf(pdf_path, tmpdir)
+            kwargs["llm_client"] = OpenAI(api_key=_LLM_API_KEY, base_url=_LLM_BASE_URL)
+            kwargs["llm_model"] = _LLM_MODEL
+            kwargs["llm_prompt"] = _llm_ocr_prompt()
+        except ImportError:
+            kwargs["enable_plugins"] = False
+    else:
+        kwargs["enable_plugins"] = False
+
+    try:
+        result = MarkItDown(**kwargs).convert(str(path))
+    except Exception as exc:
+        raise ValueError(f"MarkItDown conversion failed: {exc}") from exc
+
+    markdown = str(
+        getattr(result, "text_content", None)
+        or getattr(result, "markdown", None)
+        or ""
+    ).strip()
+    markdown = _normalize_mermaid_blocks(markdown)
+    if not markdown:
+        raise ValueError("MarkItDown returned empty Markdown.")
+    return markdown + "\n"
 
 
 def _extract_pdf_text(path: Path) -> str:
@@ -422,49 +608,189 @@ def _extract_pdf_text(path: Path) -> str:
     return "\n\n".join(chunks)
 
 
-def _ocr_pdf(path: Path, tmpdir: Path) -> str:
-    _require_tesseract()
+def _pdf_pages_requiring_visual_ocr(path: Path) -> list[int]:
+    try:
+        import fitz
+    except ImportError as exc:
+        raise ValueError("PyMuPDF is required for PDF image detection.") from exc
+    pages: list[int] = []
+    with fitz.open(path) as document:
+        for index, page in enumerate(document, start=1):
+            text = page.get_text("text").strip()
+            if not text:
+                pages.append(index)
+                continue
+            page_area = max(page.rect.width * page.rect.height, 1)
+            image_ratios: list[float] = []
+            for image in page.get_images(full=True):
+                xref = image[0]
+                for rect in page.get_image_rects(xref):
+                    area = rect.width * rect.height
+                    if area > 0:
+                        image_ratios.append(area / page_area)
+            largest_image = max(image_ratios or [0])
+            total_image_area = sum(image_ratios)
+            if len(text) < 800 or largest_image >= 0.10 or total_image_area >= 0.18:
+                pages.append(index)
+    return pages
+
+
+def _convert_pdf(path: Path, tmpdir: Path) -> tuple[str, str]:
+    text = _extract_pdf_text(path)
+    image_pages = _pdf_pages_requiring_visual_ocr(path)
+    if not text.strip():
+        return _ocr_pdf(path, tmpdir), "pdf-llm-ocr"
+    chunks = [_convert_markitdown(path).strip()]
+    if image_pages:
+        image_markdown = _ocr_pdf(path, tmpdir, pages=image_pages).strip()
+        if image_markdown:
+            chunks.append("## Contenu visuel OCR\n\n" + image_markdown)
+        return "\n\n".join(chunks).strip() + "\n", "pdf-markitdown+llm-ocr"
+    return chunks[0] + "\n", "pdf-markitdown"
+
+
+def _ocr_pdf(path: Path, tmpdir: Path, pages: list[int] | None = None) -> str:
+    _require_llm_ocr()
     if not shutil.which("pdftoppm"):
-        raise ValueError("pdftoppm is required for PDF OCR.")
+        raise ValueError("pdftoppm is required to render PDF pages for LLM OCR.")
     image_prefix = tmpdir / "page"
-    subprocess.run(
-        ["pdftoppm", "-r", "200", "-png", str(path), str(image_prefix)],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=180,
+    chunks: list[str] = []
+    if pages:
+        for page_number in pages:
+            page_prefix = tmpdir / f"page-{page_number}"
+            subprocess.run(
+                ["pdftoppm", "-r", "200", "-png", "-f", str(page_number), "-l", str(page_number), str(path), str(page_prefix)],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=180,
+            )
+            for image in sorted(tmpdir.glob(f"page-{page_number}-*.png")):
+                markdown = _llm_image_to_markdown(image)
+                if markdown.strip():
+                    chunks.append(markdown.strip())
+    else:
+        subprocess.run(
+            ["pdftoppm", "-r", "200", "-png", str(path), str(image_prefix)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=180,
+        )
+        for image in sorted(tmpdir.glob("page-*.png")):
+            markdown = _llm_image_to_markdown(image)
+            if markdown.strip():
+                chunks.append(markdown.strip())
+    return "\n\n".join(chunks).strip() + "\n"
+
+
+def _ocr_image(path: Path, tmpdir: Path | None = None) -> str:
+    _require_llm_ocr()
+    return _llm_image_to_markdown(path).strip() + "\n"
+
+
+def _require_llm_ocr() -> None:
+    if not _LLM_API_KEY:
+        raise ValueError("LLM OCR requires DOCUMENT_LLM_API_KEY or OPENAI_API_KEY.")
+    if not _LLM_MODEL:
+        raise ValueError("LLM OCR requires DOCUMENT_LLM_MODEL.")
+
+
+def _llm_image_to_markdown(path: Path) -> str:
+    _require_llm_ocr()
+    mime, _ = mimetypes.guess_type(path.name)
+    if not mime or not mime.startswith("image/"):
+        mime = "image/png"
+    image_b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    payload = {
+        "model": _LLM_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _llm_ocr_prompt()},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}", "detail": "high"}},
+                ],
+            }
+        ],
+        "temperature": 0,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        f"{_LLM_BASE_URL}/chat/completions",
+        data=data,
+        headers={
+            "Authorization": f"Bearer {_LLM_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
     )
-    page_text: list[str] = []
-    for image in sorted(tmpdir.glob("page-*.png")):
-        text = _run_tesseract(image)
-        if text.strip():
-            page_text.append(text.strip())
-    return _plain_text_to_markdown("\n\n".join(page_text))
+    try:
+        with urllib.request.urlopen(request, timeout=_LLM_TIMEOUT_SECONDS) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        raise ValueError(f"LLM OCR failed: {exc}") from exc
 
-
-def _ocr_image(path: Path) -> str:
-    _require_tesseract()
-    return _plain_text_to_markdown(_run_tesseract(path))
-
-
-def _require_tesseract() -> None:
-    if not _ENABLE_OCR:
-        raise ValueError("OCR is disabled by DOCUMENT_ENABLE_OCR=false.")
-    if not shutil.which("tesseract"):
-        raise ValueError("tesseract is required for OCR.")
-
-
-def _run_tesseract(path: Path) -> str:
-    result = subprocess.run(
-        ["tesseract", str(path), "stdout", "-l", _OCR_LANG],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=120,
+    content = (
+        result.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
     )
-    return result.stdout
+    markdown = _clean_llm_markdown(str(content))
+    if not markdown:
+        raise ValueError("LLM OCR returned empty Markdown.")
+    return markdown
+
+
+def _llm_ocr_prompt() -> str:
+    return (
+        "Convertis cette image en Markdown fidèle. "
+        "Retourne uniquement le Markdown, sans commentaire hors contenu. "
+        "Préserve les libellés en français, les titres, listes, tableaux et relations visibles. "
+        "Si l'image contient un schéma, ajoute une section '## Diagramme Mermaid' avec un bloc ```mermaid. "
+        "Le Mermaid doit reconstruire les groupes/sous-graphes, acteurs, systèmes, bases de données, flèches, labels et protocoles visibles. "
+        "Le Mermaid doit utiliser des IDs ASCII simples, des labels entre guillemets, aucun guillemet échappé, et des retours de ligne en <br/> dans les labels. "
+        "N'invente pas d'éléments absents. Si une zone est illisible, conserve le meilleur libellé lisible."
+    )
+
+
+def _clean_llm_markdown(value: str) -> str:
+    text = value.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:markdown|md)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    return _normalize_mermaid_blocks(text.strip())
+
+
+def _normalize_mermaid_blocks(markdown: str) -> str:
+    def normalize_block(match: re.Match[str]) -> str:
+        body = match.group(1)
+        lines = [_normalize_mermaid_line(line) for line in body.splitlines()]
+        return "```mermaid\n" + "\n".join(lines).strip() + "\n```"
+
+    return re.sub(r"```mermaid\s*\n(.*?)\n```", normalize_block, markdown, flags=re.DOTALL | re.IGNORECASE)
+
+
+def _quote_mermaid_label(label: str) -> str:
+    clean = label.strip().replace(r"\"", '"').replace(r"\n", "<br/>")
+    clean = clean.replace('"', "'")
+    return f'"{clean}"'
+
+
+def _normalize_mermaid_line(line: str) -> str:
+    line = line.replace(r"\"", '"').replace(r"\n", "<br/>")
+    subgraph = re.match(r'^(\s*)subgraph\s+([A-Za-z][A-Za-z0-9_]*)\[([^\"].*?)\](\s*)$', line)
+    if subgraph:
+        return f"{subgraph.group(1)}subgraph {subgraph.group(2)}[{_quote_mermaid_label(subgraph.group(3))}]{subgraph.group(4)}"
+    database = re.match(r'^(\s*)([A-Za-z][A-Za-z0-9_]*)\[\((.*?)\)\](\s*)$', line)
+    if database and any(char in database.group(3) for char in ['(', ')', '<', '>', ':']):
+        return f"{database.group(1)}{database.group(2)}[({_quote_mermaid_label(database.group(3))})]{database.group(4)}"
+    node = re.match(r'^(\s*)([A-Za-z][A-Za-z0-9_]*)\[([^\[\"\(].*?)\](\s*)$', line)
+    if node:
+        return f"{node.group(1)}{node.group(2)}[{_quote_mermaid_label(node.group(3))}]{node.group(4)}"
+    return line
 
 
 def _plain_text_to_markdown(text: str) -> str:
@@ -546,11 +872,14 @@ def create_starlette_app() -> Starlette:
         async with streamable_http.run():
             yield
 
+    async def correction(request: Request) -> HTMLResponse:
+        return HTMLResponse(_render_correction_page())
+
     middleware = [
         Middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]),
         Middleware(_BearerAuthMiddleware),
     ]
-    return Starlette(routes=[Mount("/", app=handle_mcp)], middleware=middleware, lifespan=lifespan)
+    return Starlette(routes=[Route("/correction", correction), Mount("/", app=handle_mcp)], middleware=middleware, lifespan=lifespan)
 
 
 def main() -> None:

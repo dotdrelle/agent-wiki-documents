@@ -8,7 +8,7 @@ for wiki ingestion workflows.
 
 - `document_mcp_server.py`: Starlette/uvicorn MCP server with bearer-auth
   middleware and conversion tools.
-- `Dockerfile`: runtime image with LibreOffice, Poppler and Tesseract OCR.
+- `Dockerfile`: runtime image with MarkItDown, Poppler and LLM OCR support.
 - `docker-compose.yml`: standalone local service on port `3337` by default.
 - `documents/input`: mounted input directory for local files.
 - `WORKSPACES_ROOT`: container root for all workspaces. When a conversion call
