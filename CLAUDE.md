@@ -31,3 +31,6 @@ volumes local or encrypted in production.
 
 Set `WORKSPACES_ROOT` before `docker compose up`; generated Markdown is written
 to the workspace selected by the `workspace` tool argument.
+
+Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager` release
+version so status responses identify the deployed agent bundle.
