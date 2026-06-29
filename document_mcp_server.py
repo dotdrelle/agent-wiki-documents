@@ -35,7 +35,7 @@ import uvicorn
 
 app = Server("agent-wiki-documents")
 
-_AGENT_VERSION = "0.6.31"
+_AGENT_VERSION = "0.6.47"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _DOCUMENT_INPUT_DIR = Path(os.environ.get("DOCUMENT_INPUT_DIR", "/documents/input")).resolve()
 _DOCUMENT_OUTPUT_DIR = Path(os.environ.get("DOCUMENT_OUTPUT_DIR", "/documents/output")).resolve()
@@ -50,9 +50,9 @@ _conversion_jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 
 _CONVERSION_PLAN_STEPS = [
-    {"id": "resolve", "label": "Résoudre le fichier source"},
-    {"id": "convert", "label": "Convertir en Markdown"},
-    {"id": "write", "label": "Écrire le Markdown converti"},
+    {"id": "resolve", "label": "Resolve source file"},
+    {"id": "convert", "label": "Convert to Markdown"},
+    {"id": "write", "label": "Write converted Markdown"},
 ]
 
 if not _MCP_TOKEN:
@@ -137,7 +137,7 @@ def _run_conversion_job(job_id: str, args: dict[str, Any]) -> None:
     tmpdir_obj = tempfile.TemporaryDirectory(prefix="agent-wiki-documents-")
     tmpdir = Path(tmpdir_obj.name)
     try:
-        update("resolve", "Résolution du fichier source")
+        update("resolve", "Resolving source file")
         workspace = str(args.get("workspace", "") or "").strip()
         workspace_path = _validate_workspace(workspace) if workspace else None
         output_dir = (workspace_path / "raw" / "untracked") if workspace_path else _DOCUMENT_OUTPUT_DIR
@@ -148,12 +148,12 @@ def _run_conversion_job(job_id: str, args: dict[str, Any]) -> None:
             _conversion_jobs[job_id]["sourceName"] = source.name
             _conversion_jobs[job_id]["sourceStr"] = str(source)
 
-        update("convert", f"Conversion de {source.name}")
+        update("convert", f"Converting {source.name}")
         markdown, method = _convert_file(source, tmpdir)
         with _jobs_lock:
             _conversion_jobs[job_id]["method"] = method
 
-        update("write", "Écriture du Markdown converti")
+        update("write", "Writing converted Markdown")
         output_name = _safe_output_name(args.get("outputFilename"), source)
         output_path = output_dir / output_name
         final_markdown = _with_metadata(markdown, source, method) if include_metadata else markdown
@@ -303,17 +303,17 @@ def _render_correction_page() -> str:
         <textarea id="ocr" spellcheck="false"></textarea>
       </section>
       <section class="panel">
-        <label for="mermaid">Mermaid corrige</label>
+        <label for="mermaid">Corrected Mermaid</label>
         <textarea id="mermaid" spellcheck="false">flowchart LR
   A["Source"] --> B["Cible"]</textarea>
       </section>
     </div>
     <div class="toolbar">
-      <button type="button" onclick="buildMarkdown()">Generer Markdown</button>
-      <button type="button" onclick="copyMarkdown()">Copier Markdown</button>
+      <button type="button" onclick="buildMarkdown()">Generate Markdown</button>
+      <button type="button" onclick="copyMarkdown()">Copy Markdown</button>
     </div>
     <section class="panel">
-      <label for="markdown">Markdown corrige</label>
+      <label for="markdown">Corrected Markdown</label>
       <pre id="markdown"></pre>
     </section>
   </main>
@@ -323,7 +323,7 @@ def _render_correction_page() -> str:
       const mermaid = document.getElementById('mermaid').value.trim();
       const parts = [];
       if (ocr) parts.push(ocr);
-      if (mermaid) parts.push('## Diagramme Mermaid\\n\\n```mermaid\\n' + mermaid + '\\n```');
+      if (mermaid) parts.push('## Mermaid Diagram\\n\\n```mermaid\\n' + mermaid + '\\n```');
       document.getElementById('markdown').textContent = parts.join('\\n\\n');
     }
     async function copyMarkdown() {
@@ -746,13 +746,13 @@ def _llm_image_to_markdown(path: Path) -> str:
 
 def _llm_ocr_prompt() -> str:
     return (
-        "Convertis cette image en Markdown fidèle. "
-        "Retourne uniquement le Markdown, sans commentaire hors contenu. "
-        "Préserve les libellés en français, les titres, listes, tableaux et relations visibles. "
-        "Si l'image contient un schéma, ajoute une section '## Diagramme Mermaid' avec un bloc ```mermaid. "
-        "Le Mermaid doit reconstruire les groupes/sous-graphes, acteurs, systèmes, bases de données, flèches, labels et protocoles visibles. "
-        "Le Mermaid doit utiliser des IDs ASCII simples, des labels entre guillemets, aucun guillemet échappé, et des retours de ligne en <br/> dans les labels. "
-        "N'invente pas d'éléments absents. Si une zone est illisible, conserve le meilleur libellé lisible."
+        "Convert this image faithfully to Markdown. "
+        "Return only Markdown, with no commentary outside the converted content. "
+        "Preserve the visible labels, titles, lists, tables, relationships, and their original language. "
+        "If the image contains a diagram, add a '## Mermaid Diagram' section with a ```mermaid block. "
+        "The Mermaid diagram must reconstruct visible groups/subgraphs, actors, systems, databases, arrows, labels, and protocols. "
+        "Use simple ASCII Mermaid IDs, quoted labels, no escaped quotes, and <br/> line breaks inside labels. "
+        "Do not invent missing elements. If an area is unreadable, keep the best readable label."
     )
 
 
