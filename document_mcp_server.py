@@ -88,6 +88,13 @@ def _json_text(payload: dict[str, Any]) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, indent=2))]
 
 
+def _mask_secret_text(value: Any) -> str:
+    text = str(value)
+    text = re.sub(r"(?i)(authorization:\s*bearer\s+)[^\s,;]+", r"\1***", text)
+    text = re.sub(r"(?i)(api[_-]?key|token|secret|password)(['\"]?\s*[:=]\s*['\"]?)[^'\"\s,;]+", r"\1\2***", text)
+    return text
+
+
 _STEP_INDEX = {"resolve": 1, "convert": 2, "write": 3}
 _STEP_PERCENT = {"resolve": 10, "convert": 60, "write": 90}
 
@@ -172,7 +179,7 @@ def _run_conversion_job(job_id: str, args: dict[str, Any]) -> None:
             _conversion_jobs[job_id]["status"] = "failed"
             _conversion_jobs[job_id]["error"] = str(exc)
             _conversion_jobs[job_id]["detail"] = None
-        print(f"[document-mcp] conversion job {job_id} failed: {exc}")
+        print(f"[document-mcp] conversion job {job_id} failed: {_mask_secret_text(exc)}")
     finally:
         tmpdir_obj.cleanup()
 
@@ -415,7 +422,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         print(f"[document-mcp] tools/result {name} ok {int((time.time() - start) * 1000)}ms")
         return result
     except Exception as exc:
-        print(f"[document-mcp] tools/result {name} error {int((time.time() - start) * 1000)}ms {exc}")
+        print(f"[document-mcp] tools/result {name} error {int((time.time() - start) * 1000)}ms {_mask_secret_text(exc)}")
         return _json_text({"ok": False, "error": str(exc)})
 
 
