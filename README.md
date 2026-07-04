@@ -109,6 +109,12 @@ Authorization: Bearer <same-token>
 If `MCP_AUTH_TOKEN` is empty, the server accepts unauthenticated requests.
 Use that only for local debugging.
 
+For scoped HTTP access, set `MCP_READ_TOKEN` for status-only clients and
+`MCP_WRITE_TOKEN` for clients allowed to start conversions. `MCP_AUTH_TOKEN`
+remains a legacy full-access read+write token. Rate limiting defaults to 120
+requests per 60 seconds and can be tuned with `MCP_RATE_LIMIT_REQUESTS` and
+`MCP_RATE_LIMIT_WINDOW_SECONDS`.
+
 The conversion tool accepts either:
 
 - `workspace`: optional target workspace. When set, output goes to that

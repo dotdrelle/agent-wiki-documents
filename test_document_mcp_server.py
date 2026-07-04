@@ -131,6 +131,18 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertNotIn("secret", masked)
         self.assertNotIn("tok123", masked)
 
+    def test_read_scope_cannot_start_conversion(self):
+        token = self.server._CURRENT_SCOPES.set({"read"})
+        try:
+            denied = self.server._require_tool_scope("documents_convert_to_markdown")
+            allowed = self.server._require_tool_scope("documents_status")
+        finally:
+            self.server._CURRENT_SCOPES.reset(token)
+
+        self.assertFalse(self.payload(denied)["ok"])
+        self.assertIn("write scope", self.payload(denied)["error"])
+        self.assertIsNone(allowed)
+
 
 if __name__ == "__main__":
     unittest.main()
