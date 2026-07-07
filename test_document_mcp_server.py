@@ -121,6 +121,29 @@ class DocumentMcpServerTest(unittest.TestCase):
         self.assertIn("hello", status["markdown"])
         self.assertTrue(Path(status["outputPath"]).is_file())
 
+    def test_image_conversion_continues_when_llm_ocr_is_unavailable(self):
+        self.server._LLM_API_KEY = ""
+        source = self.input_dir / "scan.png"
+        source.write_bytes(b"not really an image but enough for fallback test")
+
+        start = self.payload(self.server._tool_convert_to_markdown({"filePath": "scan.png"}))
+        self.assertTrue(start["ok"])
+        job_id = start["jobId"]
+
+        status = {}
+        for _ in range(50):
+            status = self.payload(self.server._tool_conversion_status({"jobId": job_id}))
+            if status["_activity"]["status"] != "running":
+                break
+            time.sleep(0.02)
+
+        self.assertTrue(status["ok"])
+        self.assertEqual(status["_activity"]["status"], "done")
+        self.assertEqual(status["method"], "image-fallback")
+        self.assertIn("skipped", status["ocr"])
+        self.assertIn("ocr: \"skipped", status["markdown"])
+        self.assertTrue(Path(status["outputPath"]).is_file())
+
     def test_unknown_job_and_redaction(self):
         status = self.payload(self.server._tool_conversion_status({"jobId": "missing"}))
         self.assertFalse(status["ok"])

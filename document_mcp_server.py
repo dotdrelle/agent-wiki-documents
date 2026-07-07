@@ -37,7 +37,7 @@ import uvicorn
 
 app = Server("agent-wiki-documents")
 
-_AGENT_VERSION = "0.11.6"
+_AGENT_VERSION = "0.12.0"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _DOCUMENT_INPUT_DIR = Path(os.environ.get("DOCUMENT_INPUT_DIR", "/documents/input")).resolve()
 _DOCUMENT_OUTPUT_DIR = Path(os.environ.get("DOCUMENT_OUTPUT_DIR", "/documents/output")).resolve()
@@ -217,14 +217,15 @@ def _run_conversion_job(job_id: str, args: dict[str, Any]) -> None:
             _conversion_jobs[job_id]["sourceStr"] = str(source)
 
         update("convert", f"Converting {source.name}")
-        markdown, method = _convert_file(source, tmpdir)
+        markdown, method, ocr_status = _convert_file(source, tmpdir)
         with _jobs_lock:
             _conversion_jobs[job_id]["method"] = method
+            _conversion_jobs[job_id]["ocr"] = ocr_status
 
         update("write", "Writing converted Markdown")
         output_name = _safe_output_name(args.get("outputFilename"), source)
         output_path = output_dir / output_name
-        final_markdown = _with_metadata(markdown, source, method) if include_metadata else markdown
+        final_markdown = _with_metadata(markdown, source, method, ocr_status) if include_metadata else markdown
         output_path.write_text(final_markdown, encoding="utf-8")
         with _jobs_lock:
             _conversion_jobs[job_id].update({
@@ -525,6 +526,7 @@ def _tool_convert_to_markdown(args: dict[str, Any]) -> list[TextContent]:
             "sourceName": None,
             "sourceStr": None,
             "method": None,
+            "ocr": None,
             "outputPath": None,
             "bytes": None,
             "markdown": None,
@@ -549,6 +551,7 @@ def _tool_conversion_status(args: dict[str, Any]) -> list[TextContent]:
         result.update({
             "outputPath": job.get("outputPath"),
             "method": job.get("method"),
+            "ocr": job.get("ocr"),
             "bytes": job.get("bytes"),
             "markdown": job.get("markdown"),
         })
@@ -599,19 +602,24 @@ _OFFICE_EXTENSIONS = {".docx", ".pptx", ".xlsx", ".doc", ".ppt", ".xls", ".odt",
 _SUPPORTED_EXTENSIONS = _TEXT_EXTENSIONS | _IMAGE_EXTENSIONS | _OFFICE_EXTENSIONS | {".pdf"}
 
 
-def _convert_file(path: Path, tmpdir: Path) -> tuple[str, str]:
+def _convert_file(path: Path, tmpdir: Path) -> tuple[str, str, str | None]:
     suffix = path.suffix.lower()
     if suffix not in _SUPPORTED_EXTENSIONS:
         mime, _ = mimetypes.guess_type(path.name)
         raise ValueError(f"Unsupported file type: {suffix or mime or 'unknown'}")
     if suffix in _TEXT_EXTENSIONS:
-        return _convert_text(path), "text"
+        return _convert_text(path), "text", None
     if suffix in _OFFICE_EXTENSIONS:
-        return _convert_markitdown(path, enable_llm_plugins=True), f"markitdown{suffix}"
+        markdown, ocr_status = _convert_office(path)
+        return markdown, f"markitdown{suffix}", ocr_status
     if suffix in _IMAGE_EXTENSIONS:
-        markdown = _ocr_image(path, tmpdir)
+        try:
+            markdown = _ocr_image(path, tmpdir)
+        except Exception as exc:
+            reason = _ocr_skipped_reason(exc)
+            return _fallback_visual_markdown(path, reason), "image-fallback", reason
         method = "image-llm-ocr-mermaid" if "```mermaid" in markdown else "image-llm-ocr"
-        return markdown, method
+        return markdown, method, "done"
     if suffix == ".pdf":
         return _convert_pdf(path, tmpdir)
     raise ValueError(f"Unsupported file type: {suffix}")
@@ -665,6 +673,18 @@ def _convert_markitdown(path: Path, enable_llm_plugins: bool = False) -> str:
     return markdown + "\n"
 
 
+def _convert_office(path: Path) -> tuple[str, str | None]:
+    try:
+        return _convert_markitdown(path, enable_llm_plugins=True), None
+    except Exception as exc:
+        if not _LLM_API_KEY:
+            raise
+        try:
+            return _convert_markitdown(path, enable_llm_plugins=False), _ocr_skipped_reason(exc)
+        except Exception:
+            raise exc
+
+
 def _extract_pdf_text(path: Path) -> str:
     try:
         import fitz
@@ -706,18 +726,39 @@ def _pdf_pages_requiring_visual_ocr(path: Path) -> list[int]:
     return pages
 
 
-def _convert_pdf(path: Path, tmpdir: Path) -> tuple[str, str]:
+def _convert_pdf(path: Path, tmpdir: Path) -> tuple[str, str, str | None]:
     text = _extract_pdf_text(path)
     image_pages = _pdf_pages_requiring_visual_ocr(path)
     if not text.strip():
-        return _ocr_pdf(path, tmpdir), "pdf-llm-ocr"
+        try:
+            return _ocr_pdf(path, tmpdir), "pdf-llm-ocr", "done"
+        except Exception as exc:
+            reason = _ocr_skipped_reason(exc)
+            return _fallback_pdf_markdown(path, text, reason), "pdf-fallback", reason
     chunks = [_convert_markitdown(path).strip()]
     if image_pages:
-        image_markdown = _ocr_pdf(path, tmpdir, pages=image_pages).strip()
+        try:
+            image_markdown = _ocr_pdf(path, tmpdir, pages=image_pages).strip()
+        except Exception as exc:
+            reason = _ocr_skipped_reason(exc)
+            return chunks[0].strip() + "\n", "pdf-markitdown", reason
         if image_markdown:
             chunks.append("## Contenu visuel OCR\n\n" + image_markdown)
-        return "\n\n".join(chunks).strip() + "\n", "pdf-markitdown+llm-ocr"
-    return chunks[0] + "\n", "pdf-markitdown"
+        return "\n\n".join(chunks).strip() + "\n", "pdf-markitdown+llm-ocr", "done"
+    return chunks[0] + "\n", "pdf-markitdown", None
+
+
+def _ocr_skipped_reason(exc: Exception) -> str:
+    return f"skipped ({_mask_secret_text(exc)})"
+
+
+def _fallback_visual_markdown(path: Path, reason: str) -> str:
+    return f"# {path.stem}\n\nOCR: {reason}\n\nSource image: `{path.name}`\n"
+
+
+def _fallback_pdf_markdown(path: Path, text: str, reason: str) -> str:
+    body = text.strip() if text.strip() else f"OCR: {reason}\n\nSource PDF: `{path.name}`"
+    return _plain_text_to_markdown(body)
 
 
 def _ocr_pdf(path: Path, tmpdir: Path, pages: list[int] | None = None) -> str:
@@ -879,12 +920,13 @@ def _plain_text_to_markdown(text: str) -> str:
     return "\n\n".join(blocks).strip() + "\n"
 
 
-def _with_metadata(markdown: str, source: Path, method: str) -> str:
+def _with_metadata(markdown: str, source: Path, method: str, ocr_status: str | None = None) -> str:
     title = source.stem.replace("_", " ").replace("-", " ").strip() or source.name
     front_matter = {
         "title": title,
         "source_file": source.name,
         "conversion_method": method,
+        **({"ocr": ocr_status} if ocr_status else {}),
         "service": "agent-wiki-documents",
         "service_version": _AGENT_VERSION,
     }
