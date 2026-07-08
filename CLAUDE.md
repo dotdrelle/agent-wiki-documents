@@ -23,6 +23,12 @@ for wiki ingestion workflows.
 - `documents_convert_to_markdown`: converts one file to Markdown from either a
   mounted `filePath` or `base64Content` plus `filename`.
 
+OCR degradation (0.12.0 corrective release): LLM-OCR/embedding failures must
+not fail the conversion. On such errors the server falls back to plain
+conversion (MarkItDown/PDF extraction without OCR) and flags the result with
+the skip reason (`_ocr_skipped_reason`). Keep this behavior when touching the
+conversion paths.
+
 ## Safety
 
 Do not expose this service publicly without `MCP_AUTH_TOKEN`. Uploaded and
@@ -46,16 +52,16 @@ four agent repos plus `llm-wiki`'s `mcpHttp.ts` (TypeScript) — see
 `agent-cme/CLAUDE.md`'s fuller note on why that hasn't been consolidated
 into a shared package.
 
-**Multi-user status** (0.11.0): 0.11.0 is an industrialized single-user
-deployment baseline across the wikiLLM workspace; the multi-user model is
-specified in `llm-wiki/docs/industrialisation.md` and planned for 0.12.0 —
-see `agent-cme/CLAUDE.md`'s fuller note. This agent's token scoping is
-read/write, not per-user; do not deploy it as a shared endpoint for distinct
-end users before that lot lands.
+**Multi-user status**: the wikiLLM workspace remains a single-user deployment
+baseline; the multi-user model is specified in
+`llm-wiki/docs/industrialisation.md` and planned next — see
+`agent-cme/CLAUDE.md`'s fuller note. This agent's token scoping is read/write,
+not per-user; do not deploy it as a shared endpoint for distinct end users
+before that lot lands.
 
 Keep `_AGENT_VERSION` aligned with the coordinated `llm-wiki-manager` release
 version so status responses identify the deployed agent bundle. Current release
-line: `0.11.1`. Alignment is checked by `llm-wiki-manager/scripts/check-versions.js`
+line: `0.12.0`. Alignment is checked by `llm-wiki-manager/scripts/check-versions.js`
 and synced by the root `build-and-push.sh`.
 
 MCP tool descriptions, `_activity` metadata, conversion progress labels,
