@@ -37,7 +37,7 @@ import uvicorn
 
 app = Server("agent-wiki-documents")
 
-_AGENT_VERSION = "0.14.1"
+_AGENT_VERSION = "0.14.2"
 _MCP_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 _DOCUMENT_INPUT_DIR = Path(os.environ.get("DOCUMENT_INPUT_DIR", "/documents/input")).resolve()
 _DOCUMENT_OUTPUT_DIR = Path(os.environ.get("DOCUMENT_OUTPUT_DIR", "/documents/output")).resolve()
@@ -416,8 +416,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="documents_convert_to_markdown",
             description=(
-                "Convert a PDF, Office document, text file or image to Markdown. Starts an async job and returns "
-                "immediately with a jobId and a running _activity. Poll documents_conversion_status to track progress. "
+                "Convert a PDF, Office document, text file or image to Markdown. This is the pre-ingestion step: it turns a "
+                "non-Markdown document into Markdown so it can afterwards be ingested into llm-wiki. When a workspace is given, "
+                "the Markdown is written under <workspace>/raw/untracked, where the ingestion step looks for pending sources. "
+                "Starts an async job and returns immediately with a jobId and a running _activity. Poll documents_conversion_status to track progress. "
                 "Provide either filePath for a file mounted under DOCUMENT_INPUT_DIR, or base64Content plus filename "
                 "for direct upload."
             ),
